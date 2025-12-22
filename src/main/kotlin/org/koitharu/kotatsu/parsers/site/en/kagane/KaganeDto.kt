@@ -149,7 +149,6 @@ internal class ChallengeResponse(json: JSONObject) {
 	}
 }
 
-// Metadata response: /api/v1/metadata
 internal class MetadataResult(json: JSONObject) {
 	val genres: List<MetadataTag> = parseMetadataTags(json, "genres")
 	val tags: List<MetadataTag> = parseMetadataTags(json, "tags")
@@ -190,13 +189,11 @@ internal data class FilterData(
 	val name: String,
 )
 
-// Alternate series response
 internal class AlternateSeries(json: JSONObject) {
 	val booksCount: Int = json.optInt("books_count", 0)
 	val releaseDate: String? = json.getStringOrNull("release_date")
 }
 
-// Helper functions for UID generation
 internal fun generateMangaUid(id: String): Long {
 	return id.hashCode().toLong() and 0x7FFFFFFFFFFFFFFFL
 }

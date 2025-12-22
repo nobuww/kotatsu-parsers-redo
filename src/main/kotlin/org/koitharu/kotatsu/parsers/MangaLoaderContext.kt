@@ -49,6 +49,19 @@ public abstract class MangaLoaderContext {
 	public abstract suspend fun evaluateJs(baseUrl: String, script: String, timeout: Long): String?
 
 	/**
+	 * Execute JavaScript code in a WebView with DRM permissions granted.
+	 * This is required for sites that use Widevine DRM (e.g. Kagane).
+	 *
+	 * @param baseUrl url of page script will be executed in context of
+	 * @param script JavaScript source code
+	 * @param timeout execution timeout in milliseconds
+	 * @return execution result as string, may be null
+	 */
+	public open suspend fun evaluateJsWithDrm(baseUrl: String, script: String, timeout: Long): String? {
+		throw UnsupportedOperationException("DRM WebView evaluation is not available")
+	}
+
+	/**
 	 * Open [url] in browser for some external action (e.g. captcha solving or non cookie-based authorization)
 	 */
 	public open fun requestBrowserAction(parser: MangaParser, url: String): Nothing {

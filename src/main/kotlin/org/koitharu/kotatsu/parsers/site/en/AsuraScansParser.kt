@@ -159,7 +159,9 @@ internal class AsuraScansParser(context: MangaLoaderContext) :
 		tagMap
 	}
 
-	private val regexDate = """(\d+)(st|nd|rd|th)""".toRegex()
+	// matches: {"name":112,"title":"Political Scene...","id":26511,"published_at":"2025-12-16T01:17:12.000000Z",...}
+	private val regexChapter = """"name":(\d+),"title":"([^"]*)","id":(\d+),"published_at":"([^"]+)"""".toRegex()
+	private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US)
 
 	override suspend fun getDetails(manga: Manga): Manga {
 		val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
@@ -167,29 +169,46 @@ internal class AsuraScansParser(context: MangaLoaderContext) :
 		val selectTag = doc.select("div[class^=space] > div.flex > button.text-white")
 		val tags = selectTag.mapNotNullToSet { tagMap[it.text()] }
 		val author = doc.selectFirst("div.grid > div:has(h3:eq(0):containsOwn(Author)) > h3:eq(1)")?.text().orEmpty()
+
+		val nextData = doc.selectOrThrow("script").mapNotNull { x ->
+			x.data().substringBetween("self.__next_f.push(", ")", "")
+				.trim()
+				.nullIfEmpty()
+		}.flatMap { it.jsonStrings() }
+			.joinToString("")
+
+		// extract manga slug from url for chapter url construction
+		// url format: https://asuracomic.net/series/{mangaSlug}/chapter/{chapterNum}
+		val mangaSlug = manga.url.substringAfter("/series/").substringBefore("/")
+
+		// we parse chapters directly from json data here 
+		// to avoid the url series hash that changes everyday
+		val chapters = regexChapter.findAll(nextData).mapNotNull { match ->
+			val chapterNum = match.groupValues[1].toIntOrNull() ?: return@mapNotNull null
+			val chapterTitle = match.groupValues[2]
+			val chapterId = match.groupValues[3].toLongOrNull() ?: return@mapNotNull null
+			val publishedAt = match.groupValues[4]
+
+			val url = "https://$domain/series/$mangaSlug/chapter/$chapterNum"
+
+			MangaChapter(
+				id = generateUid(chapterId.toString()),
+				title = "Chapter $chapterNum" + if (chapterTitle.isNotEmpty()) " - $chapterTitle" else "",
+				number = chapterNum.toFloat(),
+				volume = 0,
+				url = url,
+				scanlator = null,
+				uploadDate = dateFormat.parseSafe(publishedAt.substringBefore(".")),
+				branch = null,
+				source = source,
+			)
+		}.sortedBy { it.number }.toList()
+
 		return manga.copy(
 			description = doc.selectFirst("span.font-medium.text-sm")?.text().orEmpty(),
 			tags = tags,
 			authors = setOf(author),
-			chapters = doc.select("div.scrollbar-thumb-themecolor > div.group").mapChapters(reversed = true) { i, div ->
-				val a = div.selectLastOrThrow("a")
-				val urlRelative = "/series/" + a.attrAsRelativeUrl("href")
-				val url = urlRelative.toAbsoluteUrl(domain)
-				val date = div.selectLast("h3")?.text().orEmpty()
-				val cleanDate = date.replace(regexDate, "$1")
-				MangaChapter(
-					id = generateUid(url),
-					title = div.selectFirst("h3")?.textOrNull(),
-					number = i + 1f,
-					volume = 0,
-					url = url,
-					scanlator = null,
-					uploadDate = SimpleDateFormat("MMMM d yyyy", Locale.US)
-						.parseSafe(cleanDate),
-					branch = null,
-					source = source,
-				)
-			},
+			chapters = chapters,
 		)
 	}
 

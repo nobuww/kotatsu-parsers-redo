@@ -1,6 +1,5 @@
 package org.koitharu.kotatsu.parsers.site.en.kagane
 
-import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
@@ -16,6 +15,7 @@ import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
 import java.util.*
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -43,13 +43,20 @@ internal class Kagane(context: MangaLoaderContext) :
 			isSearchSupported = true,
 		)
 
-	private val apiHeaders: Headers by lazy {
-		Headers.Builder()
+	private val apiHeaders: okhttp3.Headers by lazy {
+		okhttp3.Headers.Builder()
 			.add("User-Agent", config[userAgentKey])
 			.add("Origin", "https://$domain")
 			.add("Referer", "https://$domain/")
 			.add("Accept", "application/json")
-			.add("Accept-Encoding", "identity")  // disable compression to avoid gzip issues
+			.add("Accept-Encoding", "identity")
+			.build()
+	}
+
+	private val simpleClient: okhttp3.OkHttpClient by lazy {
+		okhttp3.OkHttpClient.Builder()
+			.connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+			.readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
 			.build()
 	}
 
@@ -80,21 +87,31 @@ internal class Kagane(context: MangaLoaderContext) :
 			addQueryParameter("size", pageSize.toString())
 
 			if (!filter.query.isNullOrEmpty()) {
-				addQueryParameter("name", filter.query)
+				addQueryParameter("name", filter.query!!.trim())
 			}
 
-			val sortParam = when (order) {
-				SortOrder.UPDATED -> "updated_at,desc"
-				SortOrder.POPULARITY -> "total_views,desc"
-				SortOrder.ALPHABETICAL -> "series_name"
-				else -> "updated_at,desc"
+			if (filter.query.isNullOrEmpty()) {
+				val sortParam = when (order) {
+					SortOrder.UPDATED -> "updated_at,desc"
+					SortOrder.POPULARITY -> "total_views,desc"
+					SortOrder.ALPHABETICAL -> "series_name"
+					else -> "updated_at,desc"
+				}
+				addQueryParameter("sort", sortParam)
 			}
-			addQueryParameter("sort", sortParam)
+			
 			addQueryParameter("scanlations", "true")
 		}.build()
 
-		// use a fresh OkHttpClient without compression interceptors
-		// using compression interceptors caused errors on api calls
+		val json = fetchAndParseJson(url, body)
+		val result = SearchResult(json)
+
+		return result.content.map { book ->
+			book.toManga(apiUrl, source, showSource = false)
+		}
+	}
+
+	private suspend fun fetchAndParseJson(url: okhttp3.HttpUrl, body: JSONObject): JSONObject {
 		val requestBody = body.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
 		val request = okhttp3.Request.Builder()
 			.url(url)
@@ -106,11 +123,6 @@ internal class Kagane(context: MangaLoaderContext) :
 			.header("Content-Type", "application/json; charset=utf-8")
 			.build()
 
-		val simpleClient = okhttp3.OkHttpClient.Builder()
-			.connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-			.readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-			.build()
-
 		val response = simpleClient.newCall(request).await()
 		val responseBody = response.body.string()
 
@@ -118,26 +130,20 @@ internal class Kagane(context: MangaLoaderContext) :
 			throw IllegalStateException("API returned HTTP ${response.code}: ${responseBody.take(500)}")
 		}
 
-		val json = try {
+		return try {
 			JSONObject(responseBody)
 		} catch (e: Exception) {
-			// debug error message
 			throw IllegalStateException(
 				"API returned non-JSON response (HTTP ${response.code}). First 500 chars: ${responseBody.take(500)}",
 				e,
 			)
 		}
-
-		val result = SearchResult(json)
-
-		return result.content.map { book ->
-			book.toManga(apiUrl, source, showSource = false)
-		}
 	}
 
-	// TODO: fix broken search and genre filter
 	private fun buildSearchBody(filter: MangaListFilter): JSONObject {
 		val json = JSONObject()
+
+		json.put("sources", JSONArray())
 
 		json.put("content_rating", JSONArray().apply {
 			put("safe")
@@ -149,7 +155,7 @@ internal class Kagane(context: MangaLoaderContext) :
 		if (filter.tags.isNotEmpty()) {
 			val inclusiveGenres = JSONObject().apply {
 				put("values", JSONArray().apply {
-					filter.tags.forEach { put(it.key) }
+					filter.tags.forEach { put(it.title) }
 				})
 				put("match_all", true)
 			}
@@ -251,7 +257,7 @@ internal class Kagane(context: MangaLoaderContext) :
 		val keyIdBytes = sha256("$seriesId:$chapterId").sliceArray(0 until 16)
 
 		// generate DRM challenge using WebView with DRM permissions
-		val challenge = getDrmChallengeViaWebView(keyIdBytes, chapterId)
+		val challenge = getDrmChallengeViaWebView(keyIdBytes)
 
 		val challengeUrl = "$apiUrl/api/v1/books/$seriesId/file/$chapterId".toHttpUrl()
 		val challengeBody = JSONObject().apply {
@@ -269,11 +275,6 @@ internal class Kagane(context: MangaLoaderContext) :
 			.header("Content-Type", "application/json; charset=utf-8")
 			.build()
 
-		val simpleClient = okhttp3.OkHttpClient.Builder()
-			.connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-			.readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-			.build()
-
 		val response = simpleClient.newCall(request).await()
 		val responseBody = response.body.string()
 
@@ -285,7 +286,7 @@ internal class Kagane(context: MangaLoaderContext) :
 		return ChallengeResponse(responseJson)
 	}
 
-	private suspend fun getDrmChallengeViaWebView(keyId: ByteArray, chapterId: String): String {
+	private suspend fun getDrmChallengeViaWebView(keyId: ByteArray): String {
 		val widevineCert = fetchWidevineCertificate()
 		val psshBase64 = java.util.Base64.getEncoder().encodeToString(buildPsshBox(keyId))
 
@@ -353,11 +354,30 @@ internal class Kagane(context: MangaLoaderContext) :
 			})();
 		""".trimIndent()
 
-		var result = context.evaluateJsWithDrm("https://$domain", script, 15000L)
-			?: throw IllegalStateException("Failed to get DRM challenge: WebView returned null")
-
-		if (result.startsWith("\"") && result.endsWith("\"")) {
-			result = result.substring(1, result.length - 1)
+		// we need to wait for either __kaganeChallenge or __kaganeError to be set
+		val maxAttempts = 30  // 30 attempts * 500ms = 15 seconds max
+		var result: String? = null
+		
+		for (attempt in 1..maxAttempts) {
+			result = context.evaluateJsWithDrm("https://$domain", script, 15000L)
+			
+			if (result != null) {
+				if (result.startsWith("\"") && result.endsWith("\"")) {
+					result = result.substring(1, result.length - 1)
+				}
+				
+				if (result.isNotEmpty() && result != "null") {
+					break
+				}
+			}
+			
+			// still working or no result yet
+			// wait and retry
+			delay(500L)
+		}
+		
+		if (result.isNullOrEmpty() || result == "null") {
+			throw IllegalStateException("Failed to get DRM challenge: Timed out waiting for WebView response")
 		}
 
 		if (result.startsWith("ERROR:")) {
@@ -423,9 +443,18 @@ internal class Kagane(context: MangaLoaderContext) :
 
 		if (response.code == 401 || response.code == 507) {
 			response.close()
-			// token expired, would need to refresh
-			// TODO: implement token refresh
-			throw IllegalStateException("Access token expired, please reload the chapter")
+			
+			val newChallengeResponse = runBlocking {
+				getChallengeResponse(seriesId, chapterId)
+			}
+			accessToken = newChallengeResponse.accessToken
+			cacheUrl = newChallengeResponse.cacheUrl
+			
+			response = chain.proceed(
+				request.newBuilder()
+					.url(url.newBuilder().setQueryParameter("token", accessToken).build())
+					.build(),
+			)
 		}
 
 		return KaganeImageProcessor.processImageResponse(
